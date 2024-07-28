@@ -12,4 +12,6 @@
 
 <sup>1</sup>Huazhong University of Science and Technology, <sup>2</sup>Nanyang Technological University, <sup>3</sup>SenseTime Research
 
-Coming soon!
+[Paper](https://github.com/xingyi-li/iControl3D/) | [arXiv](https://github.com/xingyi-li/iControl3D/) | [Video](https://github.com/xingyi-li/iControl3D/) | [Supp](https://github.com/xingyi-li/iControl3D/) | [Poster](https://github.com/xingyi-li/iControl3D/)
+
+This repository contains the official PyTorch implementation of our ACM MM 2024 paper "iControl3D: An Interactive System for Controllable 3D Scene Generation".
