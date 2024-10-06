@@ -1,0 +1,1006 @@
+<html>
+
+<head>
+    <title>Stablediffusion Infinity</title>
+    <meta charset="utf-8">
+    <link rel="icon" type="image/x-icon" href="./favicon.png">
+
+    <link rel="stylesheet" type="text/css"
+        href="https://cdn.jsdelivr.net/gh/lkwq007/stablediffusion-infinity@v0.1.2/css/w2ui.min.css">
+    <script type="text/javascript"
+        src="https://cdn.jsdelivr.net/gh/lkwq007/stablediffusion-infinity@v0.1.2/js/w2ui.min.js"></script>
+    <link rel="stylesheet" type="text/css"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/gh/lkwq007/stablediffusion-infinity@v0.1.2/js/fabric.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/gh/lixingyi2023/myjs2023@master/js/toolbar.js"></script>
+
+    <link rel="stylesheet" href="https://pyscript.net/alpha/pyscript.css" />
+    <script defer src="https://pyscript.net/alpha/pyscript.js"></script>
+
+    <style>
+        #container {
+            position: relative;
+            margin: auto;
+            display: block;
+        }
+
+        #container>canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        .control {
+            display: none;
+        }
+    </style>
+
+</head>
+
+<body>
+    <div>
+        <button type="button" class="control" id="export">Export</button>
+        <button type="button" class="control" id="outpaint">Outpaint</button>
+        <button type="button" class="control" id="undo">Undo</button>
+        <button type="button" class="control" id="commit">Commit</button>
+        <button type="button" class="control" id="transfer">Transfer</button>
+        <button type="button" class="control" id="upload">Upload</button>
+        <button type="button" class="control" id="draw">Draw</button>
+        <input type="text" id="mode" value="selection" class="control">
+        <input type="text" id="setup" value="0" class="control">
+        <input type="text" id="upload_content" value="0" class="control">
+        <textarea rows="1" id="selbuffer" name="selbuffer" class="control"></textarea>
+        <fieldset class="control">
+            <div>
+                <input type="radio" id="mode0" name="mode" value="0" checked>
+                <label for="mode0">SelBox</label>
+            </div>
+            <div>
+                <input type="radio" id="mode1" name="mode" value="1">
+                <label for="mode1">Image</label>
+            </div>
+            <div>
+                <input type="radio" id="mode2" name="mode" value="2">
+                <label for="mode2">Brush</label>
+            </div>
+        </fieldset>
+    </div>
+    <div id="outer_container">
+        <div id="container">
+            <canvas id="canvas0"></canvas>
+            <canvas id="canvas1"></canvas>
+            <canvas id="canvas2"></canvas>
+            <canvas id="canvas3"></canvas>
+            <canvas id="canvas4"></canvas>
+            <!--  <canvas id = "canvas5"></canvas>-->
+            <div id="overlay_container" style="pointer-events: none">
+                <canvas id="overlay_canvas" width="1" height="1"></canvas>
+            </div>
+        </div>
+        <input type="file" name="file" id="upload_file" accept="image/*" hidden>
+        <input type="file" name="state" id="upload_state" accept=".sdinf" hidden>
+        <div style="position: relative;">
+            <div id="toolbar" style></div>
+        </div>
+    </div>
+    <py-env>
+        - numpy
+        - Pillow
+        - paths:
+        - ./canvas.py
+    </py-env>
+
+    <py-script>
+        from pyodide import to_js, create_proxy
+        from PIL import Image
+        import io
+        import time
+        import base64
+        from collections import deque
+        import numpy as np
+        from js import (
+        console,
+        document,
+        parent,
+        devicePixelRatio,
+        ImageData,
+        Uint8ClampedArray,
+        CanvasRenderingContext2D as Context2d,
+        requestAnimationFrame,
+        window,
+        encodeURIComponent,
+        w2ui,
+        update_eraser,
+        update_scale,
+        adjust_selection,
+        update_count,
+        enable_result_lst,
+        setup_shortcut,
+        update_undo_redo,
+        )
+
+        from canvas import InfCanvas
+
+
+        class History:
+        def __init__(self, maxlen=10):
+        self.idx = -1
+        self.undo_lst = deque([], maxlen=maxlen)
+        self.redo_lst = deque([], maxlen=maxlen)
+        self.state = None
+
+        def undo(self):
+        cur = None
+        if len(self.undo_lst):
+        cur = self.undo_lst.pop()
+        self.redo_lst.appendleft(cur)
+        return cur
+
+        def redo(self):
+        cur = None
+        if len(self.redo_lst):
+        cur = self.redo_lst.popleft()
+        self.undo_lst.append(cur)
+        return cur
+
+        def check(self):
+        return len(self.undo_lst) > 0, len(self.redo_lst) > 0
+
+        def append(self, state, update=True):
+        self.redo_lst.clear()
+        self.undo_lst.append(state)
+        if update:
+        update_undo_redo(*self.check())
+
+
+        history = History()
+
+        base_lst = [None]
+
+
+        async def draw_canvas() -> None:
+        width = 1024
+        height = 600
+        canvas = InfCanvas(1024, 600)
+        update_eraser(canvas.eraser_size, min(canvas.selection_size_h, canvas.selection_size_w))
+        document.querySelector("#container").style.height = f"{height}px"
+        document.querySelector("#container").style.width = f"{width}px"
+        canvas.setup_mouse()
+        canvas.clear_background()
+        canvas.draw_buffer()
+        # canvas.draw_workspace_box()
+        canvas.draw_selection_box()
+        base_lst[0] = canvas
+
+
+        async def draw_canvas_func(event):
+        try:
+        app = parent.document.querySelector("gradio-app")
+        if app.shadowRoot:
+        app = app.shadowRoot
+        width = app.querySelector("#canvas_width input").value
+        height = app.querySelector("#canvas_height input").value
+        selection_size = app.querySelector("#selection_size input").value
+        except:
+        width = 1024
+        height = 768
+        selection_size = 384
+        document.querySelector("#container").style.width = f"{width}px"
+        document.querySelector("#container").style.height = f"{height}px"
+        canvas = InfCanvas(int(width), int(height), selection_size=int(selection_size))
+        canvas.setup_mouse()
+        canvas.clear_background()
+        canvas.draw_buffer()
+        # canvas.draw_workspace_box()
+        canvas.draw_selection_box()
+        base_lst[0] = canvas
+
+
+        async def export_func(event):
+        base = base_lst[0]
+        arr = base.export()
+        base.draw_buffer()
+        base.canvas[2].clear()
+        base64_str = base.numpy_to_base64(arr)
+        time_str = time.strftime("%Y%m%d_%H%M%S")
+        link = document.createElement("a")
+        if len(event.data) > 2 and event.data[2]:
+        filename = event.data[2]
+        else:
+        filename = f"outpaint_{time_str}"
+        # link.download = f"sdinf_state_{time_str}.json"
+        link.download = f"{filename}.png"
+        # link.download = f"outpaint_{time_str}.png"
+        link.href = "data:image/png;base64," + base64_str
+        link.click()
+        console.log(f"Canvas saved to {filename}.png")
+
+
+        img_candidate_lst = [None, 0]
+
+
+        async def outpaint_func(event):
+        base = base_lst[0]
+        if len(event.data) == 2:
+        app = parent.document.querySelector("gradio-app")
+        if app.shadowRoot:
+        app = app.shadowRoot
+        base64_str_raw = app.querySelector("#output textarea").value
+        base64_str_lst = base64_str_raw.split(",")
+        img_candidate_lst[0] = base64_str_lst
+        img_candidate_lst[1] = 0
+        elif event.data[2] == "next":
+        img_candidate_lst[1] += 1
+        elif event.data[2] == "prev":
+        img_candidate_lst[1] -= 1
+        enable_result_lst()
+        if img_candidate_lst[0] is None:
+        return
+        lst = img_candidate_lst[0]
+        idx = img_candidate_lst[1]
+        update_count(idx % len(lst) + 1, len(lst))
+        arr = base.base64_to_numpy(lst[idx % len(lst)])
+        base.fill_selection(arr)
+        base.draw_selection_box()
+        # base.draw_workspace_box()
+
+        async def update_buffer_func(event):
+        base = base_lst[0]
+        app = parent.document.querySelector("gradio-app")
+        if app.shadowRoot:
+        app = app.shadowRoot
+        base64_str_raw_buffer = app.querySelector("#render_output textarea").value
+        # base64_str_raw_R = app.querySelector("#rotation textarea").value
+        # base64_str_raw_t = app.querySelector("#translation textarea").value
+
+        buffer = base.base64_to_numpy(base64_str_raw_buffer)
+        # R = base.float_base64_to_numpy(base64_str_raw_R)
+        # t = base.float_base64_to_numpy(base64_str_raw_t)
+
+        base.buffer = buffer
+        # base.R = R
+        # base.t = t
+        base.draw_buffer()
+
+
+        async def undo_func(event):
+        base = base_lst[0]
+        img_candidate_lst[0] = None
+        if base.sel_dirty:
+        base.sel_buffer = np.zeros((base.selection_size_h, base.selection_size_w, 4), dtype=np.uint8)
+        base.sel_dirty = False
+        base.canvas[2].clear()
+
+
+        async def commit_func(event):
+        base = base_lst[0]
+        img_candidate_lst[0] = None
+        if base.sel_dirty:
+        base.write_selection_to_buffer()
+        base.draw_buffer()
+        base.canvas[2].clear()
+        if len(event.data) > 2:
+        history.append(base.save())
+
+        # # TEST: update pcd here
+        # base.update_pcd()
+
+
+        async def history_undo_func(event):
+        base = base_lst[0]
+        if base.buffer_dirty or len(history.redo_lst) > 0:
+        state = history.undo()
+        else:
+        history.undo()
+        state = history.undo()
+        if state is not None:
+        base.load(state)
+        update_undo_redo(*history.check())
+
+
+        async def history_setup_func(event):
+        base = base_lst[0]
+        history.undo_lst.clear()
+        history.redo_lst.clear()
+        history.append(base.save(), update=False)
+
+
+        async def history_redo_func(event):
+        base = base_lst[0]
+        if len(history.undo_lst) > 0:
+        state = history.redo()
+        else:
+        history.redo()
+        state = history.redo()
+        if state is not None:
+        base.load(state)
+        update_undo_redo(*history.check())
+
+
+        async def transfer_func(event):
+        base = base_lst[0]
+        base.read_selection_from_buffer()
+        sel_buffer = base.sel_buffer
+        sel_buffer_str = base.numpy_to_base64(sel_buffer)
+        app = parent.document.querySelector("gradio-app")
+        if app.shadowRoot:
+        app = app.shadowRoot
+        app.querySelector("#input textarea").value = sel_buffer_str
+        app.querySelector("#proceed").click()
+
+
+        async def upload_func(event):
+        base = base_lst[0]
+        # base64_str=event.data[1]
+        base64_str = document.querySelector("#upload_content").value
+        base64_str = base64_str.split(",")[-1]
+        # base64_str=parent.document.querySelector("gradio-app").shadowRoot.querySelector("#upload textarea").value
+        arr = base.base64_to_numpy(base64_str)
+        h, w, c = base.buffer.shape
+        base.sync_to_buffer()
+        base.buffer_dirty = True
+        mask = arr[:, :, 3:4].repeat(4, axis=2)
+        base.buffer[mask > 0] = 0
+        # in case mismatch
+        base.buffer[0:h, 0:w, :] += arr
+        #base.buffer[yo:yo+h,xo:xo+w,0:3]=arr[:,:,0:3]
+        #base.buffer[yo:yo+h,xo:xo+w,-1]=arr[:,:,-1]
+        base.draw_buffer()
+        if len(event.data) > 2:
+        history.append(base.save())
+
+
+        async def setup_shortcut_func(event):
+        setup_shortcut(event.data[1])
+
+
+        document.querySelector("#export").addEventListener("click", create_proxy(export_func))
+        document.querySelector("#undo").addEventListener("click", create_proxy(undo_func))
+        document.querySelector("#commit").addEventListener("click", create_proxy(commit_func))
+        document.querySelector("#outpaint").addEventListener("click", create_proxy(outpaint_func))
+        document.querySelector("#upload").addEventListener("click", create_proxy(upload_func))
+
+        document.querySelector("#transfer").addEventListener("click", create_proxy(transfer_func))
+        document.querySelector("#draw").addEventListener("click", create_proxy(draw_canvas_func))
+
+
+        async def setup_func():
+        document.querySelector("#setup").value = "1"
+
+
+        async def reset_func(event):
+        base = base_lst[0]
+        base.reset()
+
+
+        async def load_func(event):
+        base = base_lst[0]
+        base.load(event.data[1])
+
+
+        async def save_func(event):
+        base = base_lst[0]
+        json_str = base.save()
+        time_str = time.strftime("%Y%m%d_%H%M%S")
+        link = document.createElement("a")
+        if len(event.data) > 2 and event.data[2]:
+        filename = str(event.data[2]).strip()
+        else:
+        filename = f"outpaint_{time_str}"
+        # link.download = f"sdinf_state_{time_str}.json"
+        link.download = f"{filename}.sdinf"
+        link.href = "data:text/json;charset=utf-8," + encodeURIComponent(json_str)
+        link.click()
+
+
+        async def prev_result_func(event):
+        base = base_lst[0]
+        base.reset()
+
+
+        async def next_result_func(event):
+        base = base_lst[0]
+        base.reset()
+
+
+        async def zoom_in_func(event):
+        base = base_lst[0]
+        if not base.lock_view:
+        scale = base.scale
+        if scale >= 0.2:
+        scale -= 0.1
+        if len(event.data) > 2:
+        base.update_scale(scale, int(event.data[2]), int(event.data[3]))
+        else:
+        base.update_scale(scale)
+        scale = base.scale
+        update_scale(f"{base.width}x{base.height} ({round(100 / scale)}%)")
+
+
+        async def zoom_out_func(event):
+        base = base_lst[0]
+        if not base.lock_view:
+        scale = base.scale
+        if scale < 10: scale +=0.1 console.log(len(event.data)) if len(event.data)> 2:
+            base.update_scale(scale, int(event.data[2]), int(event.data[3]))
+            else:
+            base.update_scale(scale)
+            scale = base.scale
+            update_scale(f"{base.width}x{base.height} ({round(100 / scale)}%)")
+
+
+            async def sync_func(event):
+            base = base_lst[0]
+            base.sync_to_buffer()
+            base.canvas[2].clear()
+
+
+            async def eraser_size_func(event):
+            base = base_lst[0]
+            eraser_size = min(int(event.data[1]), min(base.selection_size_h, base.selection_size_w))
+            eraser_size = max(8, eraser_size)
+            base.eraser_size = eraser_size
+
+
+            async def resize_selection_func(event):
+            base = base_lst[0]
+            cursor = base.cursor
+            if len(event.data) > 3:
+            console.log(event.data)
+            base.cursor[0] = int(event.data[1])
+            base.cursor[1] = int(event.data[2])
+            base.selection_size_w = int(event.data[3]) // 8 * 8
+            base.selection_size_h = int(event.data[4]) // 8 * 8
+            base.refine_selection()
+            base.draw_selection_box()
+            # base.draw_workspace_box()
+            elif len(event.data) > 2:
+            base.draw_selection_box()
+            # base.draw_workspace_box()
+            else:
+            base.canvas[-1].clear()
+            adjust_selection(cursor[0], cursor[1], base.selection_size_w, base.selection_size_h)
+
+
+            async def eraser_func(event):
+            base = base_lst[0]
+            if event.data[1] != "eraser":
+            # base.canvas[-2].clear()
+            base.canvas[-3].clear()
+            else:
+            x, y = base.mouse_pos
+            base.draw_eraser(x, y)
+
+
+            async def resize_func(event):
+            base = base_lst[0]
+            width = int(event.data[1])
+            height = int(event.data[2])
+            if width >= 256 and height >= 256:
+            if max(base.selection_size_h, base.selection_size_w) > min(width, height):
+            base.selection_size_h = 256
+            base.selection_size_w = 256
+            base.resize(width, height)
+
+
+            async def update_3d_func(event):
+            base = base_lst[0]
+            if not base.lock_view:
+            base.lock_view = True
+            # h, w, c = base.buffer.shape
+            # # console.log(to_js([h, w, c]))
+            # base.intrinsic = np.array([[max(h, w), 0, w // 2],
+            # [0, max(h, w), h // 2],
+            # [0, 0, 1]], dtype=np.float32)
+
+            buffer = base.buffer
+            # intrinsic = base.intrinsic
+            # console.log(to_js(intrinsic.tolist()))
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # base.save_pcd_and_rgb()
+
+            buffer_str = base.numpy_to_base64(buffer)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#buffer textarea").value = buffer_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            app.querySelector("#update_3d").click()
+
+
+            # async def update_pcd_to_save_func(event):
+            # base = base_lst[0]
+            # app = parent.document.querySelector("gradio-app")
+            # if app.shadowRoot:
+            # app = app.shadowRoot
+            # base64_str_raw_pcd = app.querySelector("#pcd_output textarea").value
+            # base64_str_raw_rgb = app.querySelector("#rgb_output textarea").value
+            #
+            # pcd = base.float_base64_to_numpy(base64_str_raw_pcd).reshape(-1, 3)
+            # rgb = base.float_base64_to_numpy(base64_str_raw_rgb).reshape(-1, 4)
+            # base.pcd = pcd
+            # base.rgb = rgb
+            # console.log(to_js(pcd))
+            #
+            # base.load_pcd_and_rgb()
+
+
+            async def rotate_left_func(event):
+            # rad = -0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, rad, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(rad_delta_R))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+
+            app.querySelector("#transform textarea").value = "rotate_left"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def rotate_right_func(event):
+            # rad = 0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, rad, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+
+            app.querySelector("#transform textarea").value = "rotate_right"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def rotate_up_func(event):
+            # rad = 0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([rad, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "rotate_up"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def rotate_down_func(event):
+            # rad = -0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([rad, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "rotate_down"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def move_forward_func(event):
+            # delta = -0.0001
+            # delta = -0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, 0.0, delta], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "move_forward"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def move_backward_func(event):
+            # delta = 0.0001
+            # delta = 0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, 0.0, delta], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "move_backward"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def move_left_func(event):
+            # delta = 0.0001
+            # delta = 0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([delta, 0.0, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "move_left"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def move_right_func(event):
+            # delta = -0.0001
+            # delta = -0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([delta, 0.0, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "move_right"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def move_up_func(event):
+            # delta = 0.0001
+            # delta = 0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, delta, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "move_up"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+
+            async def move_down_func(event):
+            # delta = -0.0001
+            # delta = -0.1
+            # base = base_lst[0]
+            # R = base.R
+            # rad_delta_R = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            # t = base.t
+            # delta_t = np.array([0.0, delta, 0.0], dtype=np.float32)
+            # intrinsic = base.intrinsic
+            # pcd = base.pcd
+            # rgb = base.rgb
+            # console.log(to_js(pcd))
+            # console.log(to_js(rgb))
+            # R_str = base.float_numpy_to_base64(R)
+            # rad_delta_R_str = base.float_numpy_to_base64(rad_delta_R)
+            # t_str = base.float_numpy_to_base64(t)
+            # delta_t_str = base.float_numpy_to_base64(delta_t)
+            # intrinsic_str = base.float_numpy_to_base64(intrinsic)
+            # pcd_str = base.float_numpy_to_base64(pcd)
+            # rgb_str = base.float_numpy_to_base64(rgb)
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#transform textarea").value = "move_down"
+            # app.querySelector("#rotation textarea").value = R_str
+            # app.querySelector("#delta_rotation textarea").value = rad_delta_R_str
+            # app.querySelector("#translation textarea").value = t_str
+            # app.querySelector("#delta_translation textarea").value = delta_t_str
+            # app.querySelector("#intrinsic textarea").value = intrinsic_str
+            # app.querySelector("#pcd textarea").value = pcd_str
+            # app.querySelector("#rgb textarea").value = rgb_str
+            # base.save_pcd_and_rgb()
+            # console.log("after rgb_str")
+            app.querySelector("#camera").click()
+            # console.log("clicked camera")
+
+            async def finish_func(event):
+            app = parent.document.querySelector("gradio-app")
+            if app.shadowRoot:
+            app = app.shadowRoot
+            app.querySelector("#finish").click()
+
+
+            async def message_func(event):
+            console.log(event.data[0])
+            console.log(event.data[1])
+            if event.data[0] == "click":
+            if event.data[1] == "clear":
+            await reset_func(event)
+            elif event.data[1] == "save":
+            await save_func(event)
+            elif event.data[1] == "export":
+            await export_func(event)
+            elif event.data[1] == "accept":
+            await commit_func(event)
+            elif event.data[1] == "cancel":
+            await undo_func(event)
+            elif event.data[1] == "zoom_in":
+            await zoom_in_func(event)
+            elif event.data[1] == "zoom_out":
+            await zoom_out_func(event)
+            elif event.data[1] == "redo":
+            await history_redo_func(event)
+            elif event.data[1] == "undo":
+            await history_undo_func(event)
+            elif event.data[1] == "history":
+            await history_setup_func(event)
+            elif event.data[1] == "update_3d":
+            await update_3d_func(event)
+            elif event.data[1] == "rotate_left":
+            await rotate_left_func(event)
+            elif event.data[1] == "rotate_right":
+            await rotate_right_func(event)
+            elif event.data[1] == "rotate_up":
+            await rotate_up_func(event)
+            elif event.data[1] == "rotate_down":
+            await rotate_down_func(event)
+            elif event.data[1] == "move_forward":
+            await move_forward_func(event)
+            elif event.data[1] == "move_backward":
+            await move_backward_func(event)
+            elif event.data[1] == "move_left":
+            await move_left_func(event)
+            elif event.data[1] == "move_right":
+            await move_right_func(event)
+            elif event.data[1] == "move_up":
+            await move_up_func(event)
+            elif event.data[1] == "move_down":
+            await move_down_func(event)
+            elif event.data[1] == "finish":
+            await finish_func(event)
+            elif event.data[0] == "sync":
+            await sync_func(event)
+            elif event.data[0] == "load":
+            await load_func(event)
+            elif event.data[0] == "upload":
+            await upload_func(event)
+            elif event.data[0] == "outpaint":
+            await outpaint_func(event)
+            # elif event.data[0] == "update_pcd_to_save":
+            # await update_pcd_to_save_func(event)
+            elif event.data[0] == "update_buffer":
+            await update_buffer_func(event)
+            elif event.data[0] == "mode":
+            if event.data[1] == "canvas":
+            base = base_lst[0]
+            if not base.lock_view:
+            if event.data[1] != "selection":
+            await sync_func(event)
+            await eraser_func(event)
+            document.querySelector("#mode").value = event.data[1]
+            else:
+            if event.data[1] != "selection":
+            await sync_func(event)
+            await eraser_func(event)
+            document.querySelector("#mode").value = event.data[1]
+            elif event.data[0] == "transfer":
+            await transfer_func(event)
+            elif event.data[0] == "setup":
+            await draw_canvas_func(event)
+            elif event.data[0] == "eraser_size":
+            await eraser_size_func(event)
+            elif event.data[0] == "resize_selection":
+            await resize_selection_func(event)
+            elif event.data[0] == "shortcut":
+            await setup_shortcut_func(event)
+            elif event.data[0] == "resize":
+            await resize_func(event)
+
+
+            window.addEventListener("message", create_proxy(message_func))
+
+            import asyncio
+
+            _ = await asyncio.gather(
+            setup_func()
+            )
+    </py-script>
+
+</body>
+
+</html>
